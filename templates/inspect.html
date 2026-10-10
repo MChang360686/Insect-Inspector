@@ -44,6 +44,9 @@
   <label style="margin:.25rem .75rem">
     <input type="checkbox" id="micToggle"> Use microphone
   </label>
+  <label style="margin:.25rem .75rem; color:#9a3412; font-weight:700">
+    <input type="checkbox" id="devTickTest"> DEV/TEST: simulate “tick spotted”
+  </label>
 </div>
 
 <div class="row">
@@ -458,7 +461,14 @@ async function runCheckpoint(cp) {
   await sleep(2000);                           // hold still
   setStage("thinking", "ANALYZING THE PHOTO...");
   setStatus("Analyzing...");
-  return api("/api/inspect", { run_id: runId, checkpoint: cp.id, image: capture() });
+  const result = await api("/api/inspect", {
+    run_id: runId, checkpoint: cp.id, image: capture(),
+    dev_tick_test: $("devTickTest")?.checked === true
+  });
+  if (result.dev_test_triggered) {
+    logLine("DEV TEST", "Simulated tick finding saved to your Client record.");
+  }
+  return result;
 }
 
 // ---------- Stop everything ----------

@@ -1,3 +1,4 @@
+
 {% extends "base.html" %}
 {% block content %}
 <style>
@@ -12,7 +13,8 @@
 <h1>Results for client #{{ row.id }}</h1>
 
 <div class="rec" id="recText">{{ rec.text }}</div>
-<button id="hear">Read aloud</button> <span id="hearNote" class="small"></span>
+<button id="hear">Read aloud</button>
+<span id="hearNote" class="small"></span>
 
 <p>
   <a class="big {% if rec.go in ('products', 'both') %}yes{% endif %}" href="/products">
@@ -25,37 +27,78 @@
 
 {% if row.tick %}
   <h2>A possible tick was found</h2>
-  <p>Remove it carefully, and contact a healthcare provider if you were bitten. Products that can help:</p>
-  <ul>
-    {% for p in products %}
-      <li><a href="{{ p.productlink }}" target="_blank" rel="noopener">{{ p.productname }}</a></li>
-    {% endfor %}
-  </ul>
+  <p>
+    Remove it carefully, and contact a healthcare provider if you were bitten.
+    Products that can help:
+  </p>
+
+  {% if products %}
+    <ul>
+      {% for p in products %}
+        <li>
+          <a href="{{ p.productlink }}" target="_blank" rel="noopener">
+            {{ p.productname }}
+          </a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>No products are currently listed in the Products table.</p>
+  {% endif %}
+
   <a href="/products">See all products &rarr;</a>
 {% endif %}
 
 {% if row.bedbug %}
   <h2>A possible bed bug was found</h2>
   <p>Pest control services you can call:</p>
-  <ul>
-    {% for s in services %}
-      <li>{{ s.name }}: <a href="tel:{{ s.phonenum }}">{{ s.phonenum }}</a></li>
-    {% endfor %}
-  </ul>
+
+  {% if services %}
+    <ul>
+      {% for s in services %}
+        <li>
+          {{ s.name }}:
+          <a href="tel:{{ s.phonenum }}">{{ s.phonenum }}</a>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p>No pest control services are currently listed.</p>
+  {% endif %}
+
   <a href="/pestcontrol">See all pest control services &rarr;</a>
 {% endif %}
 
 <script>
 document.getElementById("hear").onclick = async () => {
   const note = document.getElementById("hearNote");
+
   try {
-    const r = await fetch("/api/recommend/{{ row.id }}?skipped={{ skipped_param|urlencode }}");
-    if (r.status === 409) { note.textContent = "Audio was stopped for this session."; return; }
+    const r = await fetch(
+      "/api/recommend/{{ row.id }}?skipped={{ skipped_param|urlencode }}"
+    );
+
+    if (r.status === 409) {
+      note.textContent = "Audio was stopped for this session.";
+      return;
+    }
+
     const j = await r.json();
-    if (!j.url) { note.textContent = "Voice unavailable; read the text above."; return; }
+
+    if (!j.url) {
+      note.textContent = "Voice unavailable; read the text above.";
+      return;
+    }
+
     const a = new Audio(j.url);
-    const sink = localStorage.getItem("sinkId");          // reuse the headset chosen on the inspection page
-    if (sink && a.setSinkId) { try { await a.setSinkId(sink); } catch {} }
+    const sink = localStorage.getItem("sinkId");
+
+    if (sink && a.setSinkId) {
+      try {
+        await a.setSinkId(sink);
+      } catch {}
+    }
+
     await a.play();
     note.textContent = "";
   } catch (e) {

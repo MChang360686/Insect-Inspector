@@ -1,11 +1,24 @@
+
 {% extends "base.html" %}
+
 {% block content %}
 <h1>Recommended products</h1>
-<ul>
-  {% for p in products %}
-    <li><a href="{{ p.productlink }}" target="_blank" rel="noopener">{{ p.productname }}</a></li>
-  {% else %}
-    <li>No products listed yet.</li>
-  {% endfor %}
-</ul>
+
+{% if products %}
+  <ul>
+    {% for p in products %}
+      <li>
+        {% if p.productlink %}
+          <a href="{{ p.productlink }}" target="_blank" rel="noopener noreferrer">
+            {{ p.productname or "Unnamed product" }}
+          </a>
+        {% else %}
+          {{ p.productname or "Unnamed product" }}
+        {% endif %}
+      </li>
+    {% endfor %}
+  </ul>
+{% else %}
+  <p>No products listed yet.</p>
+{% endif %}
 {% endblock %}
