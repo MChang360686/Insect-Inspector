@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  .rec { font-size: 32px; line-height: 1.3; font-weight: 600; padding: .75rem 1rem;
+         background: #111; color: #fff; border-radius: 8px; margin: 1rem 0; }
+  .big { display: inline-block; font-size: 1.4rem; padding: .8rem 1.2rem; margin: .4rem .4rem .4rem 0;
+         border-radius: 8px; text-decoration: none; border: 3px solid #999; color: #222; background: #f3f3f3; }
+  .big.yes { border-color: #1b7f3b; background: #e5f6ea; font-weight: 700; }
+  .small { color: #555; font-size: .9rem; }
+</style>
+
+<h1>Results for client #{{ row.id }}</h1>
+
+<div class="rec" id="recText">{{ rec.text }}</div>
+<button id="hear">Read aloud</button> <span id="hearNote" class="small"></span>
+
+<p>
+  <a class="big {% if rec.go in ('products', 'both') %}yes{% endif %}" href="/products">
+    Products{% if rec.go in ('products', 'both') %} (recommended){% endif %}
+  </a>
+  <a class="big {% if rec.go in ('pestcontrol', 'both') %}yes{% endif %}" href="/pestcontrol">
+    Pest Control{% if rec.go in ('pestcontrol', 'both') %} (recommended){% endif %}
+  </a>
+</p>
+
+{% if row.tick %}
+  <h2>A possible tick was found</h2>
+  <p>Remove it carefully, and contact a healthcare provider if you were bitten. Products that can help:</p>
+  <ul>
+    {% for p in products %}
+      <li><a href="{{ p.productlink }}" target="_blank" rel="noopener">{{ p.productname }}</a></li>
+    {% endfor %}
+  </ul>
+  <a href="/products">See all products &rarr;</a>
+{% endif %}
+
+{% if row.bedbug %}
+  <h2>A possible bed bug was found</h2>
+  <p>Pest control services you can call:</p>
+  <ul>
+    {% for s in services %}
+      <li>{{ s.name }}: <a href="tel:{{ s.phonenum }}">{{ s.phonenum }}</a></li>
+    {% endfor %}
+  </ul>
+  <a href="/pestcontrol">See all pest control services &rarr;</a>
+{% endif %}
+
+<script>
+document.getElementById("hear").onclick = async () => {
+  const note = document.getElementById("hearNote");
+  try {
+    const r = await fetch("/api/recommend/{{ row.id }}?skipped={{ skipped_param|urlencode }}");
+    if (r.status === 409) { note.textContent = "Audio was stopped for this session."; return; }
+    const j = await r.json();
+    if (!j.url) { note.textContent = "Voice unavailable; read the text above."; return; }
+    const a = new Audio(j.url);
+    const sink = localStorage.getItem("sinkId");          // reuse the headset chosen on the inspection page
+    if (sink && a.setSinkId) { try { await a.setSinkId(sink); } catch {} }
+    await a.play();
+    note.textContent = "";
+  } catch (e) {
+    note.textContent = "Couldn't play audio. Check your output device.";
+  }
+};
+</script>
+{% endblock %}

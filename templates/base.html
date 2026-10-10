@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pest Inspector</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    button { padding: .6rem 1rem; margin: .25rem; font-size: 1rem; cursor: pointer; }
+    video { width: 100%; max-width: 640px; background: #111; border-radius: 8px; }
+    .row { display: flex; flex-wrap: wrap; align-items: center; }
+    nav a { margin-right: 1rem; }
+  </style>
+</head>
+<body>
+  <nav><a href="/">Home</a><a href="/inspect">Inspection</a><a href="/products">Products</a><a href="/pestcontrol">Pest control</a></nav>
+  {% block content %}{% endblock %}
+</body>
+</html>

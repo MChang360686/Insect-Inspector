@@ -1,0 +1,533 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  .caption { font-size: 32px; line-height: 1.3; font-weight: 600; min-height: 130px;
+             padding: .75rem 1rem; margin: .75rem 0; background: #111; color: #fff; border-radius: 8px; }
+  #stop { background: #c62828; color: #fff; font-weight: 700; border: 0; border-radius: 6px; }
+  #stop:hover { background: #a31f1f; }
+  .small { color: #555; font-size: .9rem; }
+  select { padding: .5rem; font-size: 1rem; max-width: 100%; }
+  .badge { display: inline-block; padding: .35rem .8rem; border-radius: 999px; font-weight: 700;
+           color: #fff; margin: .25rem .5rem .25rem 0; }
+  .badge.idle { background: #777; }      .badge.listening { background: #1565c0; }
+  .badge.heard { background: #2e7d32; }  .badge.thinking { background: #ef6c00; }
+  .badge.speaking { background: #6a1b9a; } .badge.error { background: #c62828; }
+  .log { font-size: 1rem; max-height: 9rem; overflow: auto; border: 1px solid #ccc;
+         border-radius: 6px; padding: .4rem .6rem; margin-top: .4rem; min-height: 2rem; }
+  #heard { font-size: 1.1rem; font-weight: 600; }
+</style>
+
+<h1>Inspection</h1>
+<video id="cam" autoplay playsinline muted></video>
+<canvas id="snap" hidden></canvas>
+
+<div id="caption" class="caption" aria-live="polite">Camera is off.</div>
+
+<div>
+  <span id="stage" class="badge idle">IDLE</span>
+  <span id="heard"></span>
+  <div id="meterWrap" hidden class="small">Mic level
+    <meter id="level" min="0" max="0.3" value="0" style="width:200px"></meter>
+  </div>
+  <div id="log" class="log" aria-live="polite"></div>
+</div>
+<p id="status" class="small"></p>
+
+<div class="row">
+  <button id="stop">STOP EVERYTHING</button>
+  <button id="skipBtn" disabled>Skip this step</button>
+  <button id="camBtn">Turn camera on</button>
+  <button id="start">Start inspection</button>
+</div>
+
+<div class="row">
+  <label style="margin:.25rem .75rem">
+    <input type="checkbox" id="micToggle"> Use microphone
+  </label>
+</div>
+
+<div class="row">
+  <input id="textBox" type="text" placeholder="Type a reply, e.g. here, closer, what do I do?"
+         maxlength="200" style="flex:1; min-width:220px; padding:.6rem; font-size:1rem" disabled>
+  <button id="sendBtn" disabled>Send</button>
+  <button id="here" disabled>I'm in position</button>
+</div>
+<p id="timer" class="small"></p>
+
+<h3>Audio output</h3>
+<div class="row">
+  <select id="outSel"><option value="">System default (speakers)</option></select>
+  <button id="pickOut">Pick headset…</button>
+  <button id="testOut">Test sound</button>
+</div>
+<p id="outNote" class="small"></p>
+
+<script>
+// ----- Tunable limits -----
+const FAILED_ATTEMPTS_BEFORE_SKIP = 1;      // failed "I'm ready" checks before a step is skipped
+const CHECKPOINT_SECONDS = 60;              // time limit per step, counted after the instruction finishes
+const AUTO_CHECK_COUNTS_AS_FAILURE = false; // timer-triggered checks only coach; they never cause a skip
+
+const $ = id => document.getElementById(id);
+const cam = $("cam"), canvas = $("snap"), captionEl = $("caption"), statusEl = $("status");
+const camBtn = $("camBtn"), startBtn = $("start"), stopBtn = $("stop"), hereBtn = $("here"), skipBtn = $("skipBtn");
+const micToggle = $("micToggle"), textBox = $("textBox"), sendBtn = $("sendBtn"), timerEl = $("timer");
+const outSel = $("outSel"), pickOut = $("pickOut"), testOut = $("testOut"), outNote = $("outNote");
+const stageEl = $("stage"), heardEl = $("heard"), logEl = $("log");
+const meterWrap = $("meterWrap"), levelEl = $("level");
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const CAN_SINK = "setSinkId" in HTMLMediaElement.prototype;
+
+let stream = null, running = false, currentAudio = null, manualTrigger = null, activeRec = null;
+let clientId = null, runId = null, history = [], sinkId = localStorage.getItem("sinkId") || "";
+let skipRequested = false, deadline = Infinity, skippedIds = [];
+let micStream = null, audioCtx = null, meterRaf = 0;
+let ctrl = new AbortController();      // aborted by Stop; cancels all pending fetches and waits
+
+const setStatus = t => statusEl.textContent = t;
+const showCaption = t => captionEl.textContent = t;        // large 32px text
+const setHeard = t => heardEl.textContent = t;
+const requireCam = () => { if (!stream) throw new Error("cam_off"); };
+const check = () => { if (ctrl.signal.aborted) throw new Error("stopped"); };
+
+function setStage(kind, label) { stageEl.className = "badge " + kind; stageEl.textContent = label; }
+function logLine(who, text) {                                // textContent: speech is untrusted
+  const d = document.createElement("div");
+  d.textContent = `${who}: ${text}`;
+  logEl.appendChild(d);
+  while (logEl.children.length > 8) logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function sleep(ms) {
+  return new Promise((res, rej) => {
+    if (ctrl.signal.aborted) return rej(new Error("stopped"));
+    const t = setTimeout(res, ms);
+    ctrl.signal.addEventListener("abort", () => { clearTimeout(t); rej(new Error("stopped")); }, { once: true });
+  });
+}
+
+async function api(url, body) {
+  check();
+  const opts = { signal: ctrl.signal };
+  if (body !== undefined) {
+    opts.method = "POST";
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
+  try {
+    const r = await fetch(url, opts);
+    if (r.status === 409) throw new Error("stopped");          // server says this run was halted
+    if (!r.ok) throw new Error(`${url} failed (${r.status})`);
+    return await r.json();
+  } catch (e) {
+    if (e.name === "AbortError") throw new Error("stopped");
+    throw e;
+  }
+}
+
+// ---------- Audio output device (headset vs speakers) ----------
+async function refreshOutputs() {
+  if (!CAN_SINK || !navigator.mediaDevices?.enumerateDevices) return;
+  const devs = (await navigator.mediaDevices.enumerateDevices())
+    .filter(d => d.kind === "audiooutput" && d.deviceId !== "default" && d.deviceId !== "communications");
+  const keep = sinkId;
+  outSel.innerHTML = '<option value="">System default (speakers)</option>';
+  devs.forEach((d, i) => {
+    const o = document.createElement("option");
+    o.value = d.deviceId;
+    o.textContent = d.label || `Audio device ${i + 1}`;
+    outSel.appendChild(o);
+  });
+  outSel.value = [...outSel.options].some(o => o.value === keep) ? keep : "";
+  sinkId = outSel.value;
+}
+function setSink(id, label) {
+  sinkId = id || "";
+  localStorage.setItem("sinkId", sinkId);
+  if (id && ![...outSel.options].some(o => o.value === id)) {
+    const o = document.createElement("option");
+    o.value = id; o.textContent = label || "Selected device";
+    outSel.appendChild(o);
+  }
+  outSel.value = sinkId;
+}
+async function applySink(audioEl) {
+  if (!sinkId || !audioEl.setSinkId) return;
+  try { await audioEl.setSinkId(sinkId); }
+  catch { outNote.textContent = "Couldn't use that device; using the system default."; }
+}
+outSel.onchange = () => setSink(outSel.value);
+pickOut.onclick = async () => {
+  if (!navigator.mediaDevices?.selectAudioOutput) {
+    outNote.textContent = "This browser has no device picker. Use the dropdown, or set your headset as the system output.";
+    return;
+  }
+  try {
+    const d = await navigator.mediaDevices.selectAudioOutput();
+    await refreshOutputs();
+    setSink(d.deviceId, d.label);
+  } catch { /* user cancelled */ }
+};
+testOut.onclick = async () => {
+  const a = new Audio(beepUrl());       // generated locally: costs no credits
+  await applySink(a);
+  a.play().catch(() => { outNote.textContent = "The test sound couldn't play. Check the output device."; });
+};
+function beepUrl() {
+  const sr = 22050, n = Math.floor(sr * 0.4);
+  const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVEfmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true);
+  v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const env = Math.min(1, i / 500, (n - i) / 500);
+    v.setInt16(44 + i * 2, Math.sin(2 * Math.PI * 440 * i / sr) * 0.4 * env * 32767, true);
+  }
+  return URL.createObjectURL(new Blob([buf], { type: "audio/wav" }));
+}
+if (!CAN_SINK) {
+  outSel.disabled = pickOut.disabled = true;
+  outNote.textContent = "This browser can't choose an audio output. Set your Bluetooth headset as the system output in your OS sound settings (Chrome or Edge can switch it here).";
+} else {
+  outNote.textContent = "Connect your headset first, then pick it here. Names appear after the camera is on.";
+  refreshOutputs();
+  navigator.mediaDevices.addEventListener?.("devicechange", refreshOutputs);
+}
+
+// ---------- Camera (close-ups: ask for the highest resolution available) ----------
+async function startCamera() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false
+  });
+  cam.srcObject = stream;
+  await cam.play();
+  camBtn.textContent = "Turn camera off";
+  setStatus("Camera on.");
+  showCaption("Camera is on. Press Start inspection.");
+  refreshOutputs();
+}
+function releaseCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  cam.srcObject = null;
+  camBtn.textContent = "Turn camera on";
+}
+function stopCamera() {
+  releaseCamera();
+  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+  if (manualTrigger) manualTrigger("", "timeout");
+  setStatus("Camera off. Inspection paused.");
+}
+camBtn.onclick = () => stream ? stopCamera()
+  : startCamera().catch(e => setStatus("Camera error: " + e.message));
+
+// ---------- Microphone level meter ----------
+async function startMicMeter() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    await audioCtx.resume();
+    const an = audioCtx.createAnalyser();
+    an.fftSize = 1024;
+    audioCtx.createMediaStreamSource(micStream).connect(an);
+    const buf = new Float32Array(an.fftSize);
+    meterWrap.hidden = false;
+    const loop = () => {
+      an.getFloatTimeDomainData(buf);
+      let s = 0; for (const v of buf) s += v * v;
+      levelEl.value = Math.sqrt(s / buf.length);
+      meterRaf = requestAnimationFrame(loop);
+    };
+    loop();
+    if (!SR) setHeard("This browser can't transcribe speech (use Chrome or Edge). The meter works, but type your replies.");
+  } catch (e) {
+    micToggle.checked = false;
+    setStage("error", "MIC UNAVAILABLE");
+    setHeard("Microphone unavailable: " + (e.message || e.name) + ". Type your replies instead.");
+  }
+}
+function stopMicMeter() {
+  cancelAnimationFrame(meterRaf);
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  micStream = null;
+  if (audioCtx) audioCtx.close().catch(() => {});
+  audioCtx = null;
+  meterWrap.hidden = true; levelEl.value = 0;
+}
+micToggle.onchange = () => micToggle.checked ? startMicMeter() : stopMicMeter();
+
+// ---------- Voice out ----------
+async function play(url, text) {
+  check(); requireCam();
+  showCaption(text);
+  setStage("speaking", "SPEAKING");
+  if (!url) { setStatus("Voice unavailable; read the caption."); await sleep(2500); return; }
+  await new Promise(res => {
+    const a = new Audio(url);
+    currentAudio = a;
+    a.onended = () => res();
+    a.onpause = () => res();
+    a.onerror = () => { setStatus("Audio failed to load. Read the caption."); res(); };
+    applySink(a).then(() => a.play()).catch(err => {
+      setStatus(`Audio couldn't play (${err.name || "error"}). Check the output device, or press Test sound.`);
+      res();
+    });
+  });
+  currentAudio = null;
+  check();
+}
+async function sayFixed(key) {
+  const { url, text } = await api(`/api/say/${key}?run_id=${encodeURIComponent(runId ?? "")}`);
+  logLine("Coach", text);
+  await play(url, text);
+}
+async function sayCoach(r) {
+  history.push({ role: "coach", text: r.say });
+  logLine("Coach", r.say);
+  await play(r.url, r.say);
+}
+
+// ---------- Input: typed text, button, optional speech recognition ----------
+const MIC_ERRORS = {
+  "not-allowed": "Microphone blocked. Allow it in the browser's address bar.",
+  "service-not-allowed": "Speech recognition is blocked in this browser.",
+  "audio-capture": "No working microphone found.",
+  "network": "Speech service unreachable (it needs an internet connection).",
+  "no-speech": "No speech detected yet. Speak up or type.",
+};
+
+function listenOnce() {
+  const mic = micToggle.checked && SR;
+  const base = mic ? 8000 : 12000;
+  const ms = Math.min(base, Math.max(0, deadline - Date.now()));   // never wait past the step's time limit
+  if (ms <= 0) return Promise.resolve({ text: "", src: "timeout" });
+
+  hereBtn.disabled = textBox.disabled = sendBtn.disabled = false;
+  if (!mic) textBox.focus();
+  setStage("listening", mic ? "LISTENING - say 'here'" : "WAITING - type, or press the button");
+  setHeard("");
+
+  return new Promise(resolve => {
+    let done = false, fatal = false, left = Math.ceil(ms / 1000), tick = null;
+    const render = () => {
+      const stepLeft = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      timerEl.textContent = `Auto-checking in ${left}s · This step ends in ${stepLeft}s`;
+    };
+    const finish = (t, src) => {
+      if (done) return;
+      done = true; manualTrigger = null;
+      clearInterval(tick); timerEl.textContent = "";
+      hereBtn.disabled = textBox.disabled = sendBtn.disabled = true;
+      textBox.value = "";
+      try { activeRec && activeRec.abort(); } catch {}
+      activeRec = null;
+      resolve({ text: t || "", src: src || "timeout" });
+    };
+    manualTrigger = finish;
+    render();
+    tick = setInterval(() => { left = Math.max(0, left - 1); render(); }, 1000);
+    setTimeout(() => finish("", "timeout"), ms);
+
+    if (mic) {
+      const rec = new SR();
+      activeRec = rec;
+      rec.lang = "en-US";
+      rec.interimResults = true;
+      rec.continuous = false;
+      rec.onaudiostart = () => setHeard("Microphone is active. Speak now.");
+      rec.onspeechstart = () => setHeard("Hearing you...");
+      rec.onresult = e => {
+        const r = e.results[e.results.length - 1];
+        const t = r[0].transcript;
+        setHeard(`Hearing: "${t}"`);
+        if (r.isFinal) finish(t, "voice");
+      };
+      rec.onerror = e => {
+        if (e.error === "aborted") return;
+        if (["not-allowed", "service-not-allowed", "audio-capture"].includes(e.error)) fatal = true;
+        setStage("error", "MIC PROBLEM");
+        setHeard(MIC_ERRORS[e.error] || `Speech recognition error: ${e.error}`);
+      };
+      rec.onend = () => { if (!done && !fatal) { try { rec.start(); } catch {} } };
+      try { rec.start(); } catch {}
+    } else if (micToggle.checked && !SR) {
+      setHeard("This browser can't transcribe speech. Type your reply.");
+    }
+  });
+}
+hereBtn.onclick = () => manualTrigger && manualTrigger("here", "button");
+sendBtn.onclick = () => manualTrigger && manualTrigger(textBox.value.trim() || "here", "typed");
+textBox.onkeydown = e => { if (e.key === "Enter") sendBtn.click(); };
+
+skipBtn.onclick = () => {
+  skipRequested = true;
+  if (currentAudio) currentAudio.pause();          // cut off the coach mid-sentence
+  if (manualTrigger) manualTrigger("", "skip");    // unblock any wait
+};
+
+function describeInput(text, src) {
+  if (src === "voice")      { setStage("heard", "HEARD YOU");   setHeard(`You said: "${text}"`);   logLine("You (voice)", text); }
+  else if (src === "typed") { setStage("heard", "GOT YOUR MESSAGE"); setHeard(`You typed: "${text}"`); logLine("You (typed)", text); }
+  else if (src === "button"){ setStage("heard", "GOT YOUR BUTTON PRESS"); setHeard('You pressed "I\'m in position"'); logLine("You", "[pressed I'm in position]"); }
+  else                      { setStage("heard", "NO REPLY");    setHeard("Nothing heard. Checking the camera anyway."); logLine("You", "[no reply]"); }
+}
+
+function capture() {
+  requireCam();
+  canvas.width = cam.videoWidth;
+  canvas.height = cam.videoHeight;
+  canvas.getContext("2d").drawImage(cam, 0, 0);
+  return canvas.toDataURL("image/jpeg", 0.92);
+}
+
+// ---------- Checkpoint flow ----------
+function coach(cp, phase, transcript, lastAttempt) {
+  const body = { checkpoint: cp.id, phase, transcript, run_id: runId, history, last_attempt: !!lastAttempt };
+  if (phase === "check") body.image = capture();
+  return api("/api/coach", body);
+}
+
+function skipReason() {
+  if (skipRequested) return "user";
+  if (Date.now() >= deadline) return "time";
+  return null;
+}
+
+async function skipCheckpoint(cp, why) {
+  skippedIds.push(cp.id);
+  logLine("System", `Skipped ${cp.label} (${why === "user" ? "you chose to" : why === "time" ? "time limit" : "couldn't get a good view"})`);
+  if (why === "time") {
+    await sayFixed("skip_time");
+  } else {
+    showCaption(why === "failed" ? "Skipping this step..." : "Skipping this step.");
+    await sleep(1000);
+  }
+  return { skipped: true };
+}
+
+async function runCheckpoint(cp) {
+  history = [];
+  skipRequested = false;
+  deadline = Infinity;                         // the clock starts after the instruction finishes
+  skipBtn.disabled = false;
+  let failures = 0;
+
+  try {
+    setStage("thinking", "GEMINI IS PREPARING THE NEXT STEP...");
+    await sayCoach(await coach(cp, "intro", "", false));
+    deadline = Date.now() + CHECKPOINT_SECONDS * 1000;
+
+    for (;;) {
+      let why = skipReason();
+      if (why) return await skipCheckpoint(cp, why);
+
+      const { text: heard, src } = await listenOnce();
+      check(); requireCam();
+      why = skipReason();                      // time ran out, or Skip was pressed, while listening
+      if (why) return await skipCheckpoint(cp, why);
+
+      describeInput(heard, src);
+      if (heard) history.push({ role: "person", text: heard });
+
+      const counts = src !== "timeout" || AUTO_CHECK_COUNTS_AS_FAILURE;
+      const lastAttempt = counts && failures + 1 >= FAILED_ATTEMPTS_BEFORE_SKIP;
+
+      setStage("thinking", "SENT TO GEMINI - checking the camera...");
+      const r = await coach(cp, "check", heard, lastAttempt);
+      await sayCoach(r);                       // confirmation, denial, answer or skip notice
+      if (r.stop) throw new Error("stopped");
+      if (r.advance) break;
+
+      why = skipReason();
+      if (why) return await skipCheckpoint(cp, why);
+      if (counts && r.intent !== "question") {   // questions never count as failures
+        failures++;
+        if (failures >= FAILED_ATTEMPTS_BEFORE_SKIP) return await skipCheckpoint(cp, "failed");
+      }
+    }
+    if (skipRequested) return await skipCheckpoint(cp, "user");
+  } finally {
+    skipBtn.disabled = true;
+    deadline = Infinity;
+  }
+
+  await sleep(2000);                           // hold still
+  setStage("thinking", "ANALYZING THE PHOTO...");
+  setStatus("Analyzing...");
+  return api("/api/inspect", { run_id: runId, checkpoint: cp.id, image: capture() });
+}
+
+// ---------- Stop everything ----------
+function haltServer() {
+  if (!runId) return;
+  try {
+    fetch("/api/stop", { method: "POST", headers: { "Content-Type": "application/json" },
+                         body: JSON.stringify({ run_id: runId }), keepalive: true });
+  } catch {}
+}
+function stopAll() {
+  ctrl.abort();                                         // cancels fetches and waits
+  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+  try { activeRec && activeRec.abort(); } catch {}      // speech recognition
+  activeRec = null;
+  stopMicMeter();                                       // microphone stream
+  micToggle.checked = false;
+  if (manualTrigger) manualTrigger("", "timeout");
+  releaseCamera();                                      // webcam
+  haltServer();                                         // server refuses further Gemini/Supabase work
+  skipBtn.disabled = true;
+  showCaption("Stopped.");
+  setStage("idle", "STOPPED");
+  setHeard("");
+  setStatus("Camera, microphone, audio and API calls are all off.");
+}
+stopBtn.onclick = stopAll;
+window.addEventListener("pagehide", () => {
+  if (running && runId) {
+    navigator.sendBeacon("/api/stop",
+      new Blob([JSON.stringify({ run_id: runId })], { type: "application/json" }));
+  }
+});
+
+async function runInspection() {
+  if (running) return;
+  running = true; startBtn.disabled = true;
+  ctrl = new AbortController();                         // fresh run after a previous Stop
+  clientId = null; runId = null; skippedIds = [];
+  logEl.textContent = "";
+  try {
+    if (!stream) await startCamera();
+    check();
+
+    const s = await api("/api/session", {});            // new user -> new Client row; returning -> same row
+    clientId = s.client_id; runId = s.run_id;
+    setStatus(s.returning
+      ? "Welcome back. Starting a new scan (your previous result was cleared)."
+      : "Welcome. You've been added as a new user.");
+
+    const cps = await api("/api/checkpoints");
+    for (const cp of cps) await runCheckpoint(cp);
+
+    await sayFixed("done");
+    const q = `run_id=${encodeURIComponent(runId)}&skipped=${encodeURIComponent(skippedIds.join(","))}`;
+    const rec = await api(`/api/recommend/${clientId}?${q}`);   // spoken Products / Pest Control advice
+    logLine("Coach", rec.text);
+    await play(rec.url, rec.text);
+    releaseCamera();
+    location.href = `/results/${clientId}?skipped=${encodeURIComponent(skippedIds.join(","))}`;
+  } catch (e) {
+    if (e.message === "cam_off") { setStage("idle", "PAUSED"); setStatus("Camera turned off. Inspection paused."); showCaption("Camera is off."); }
+    else if (e.message === "stopped") { releaseCamera(); haltServer(); showCaption("Stopped."); setStage("idle", "STOPPED"); setStatus("Inspection stopped."); }
+    else { setStage("error", "ERROR"); setStatus("Error: " + e.message); console.error(e); }
+  } finally {
+    skipBtn.disabled = true;
+    running = false; startBtn.disabled = false;
+  }
+}
+startBtn.onclick = runInspection;
+</script>
+{% endblock %}

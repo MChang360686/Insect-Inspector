@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Clients</h1>
+<ul>
+  {% for c in clients %}
+    <li><a href="/results/{{ c.id }}">#{{ c.id }}</a> tick: {{ c.tick }} / bedbug: {{ c.bedbug }}</li>
+  {% endfor %}
+</ul>
+{% endblock %}

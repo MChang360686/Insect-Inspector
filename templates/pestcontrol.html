@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Pest control services</h1>
+<ul>
+  {% for s in services %}
+    <li>{{ s.name }}: <a href="tel:{{ s.phonenum }}">{{ s.phonenum }}</a></li>
+  {% else %}
+    <li>No services listed yet.</li>
+  {% endfor %}
+</ul>
+{% endblock %}
