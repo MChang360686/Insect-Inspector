@@ -871,10 +871,34 @@ def clients():
 def products():
     # Fetch every row from the Supabase Products table and pass
     # the returned dictionaries to templates/products.html.
-    return render_template(
+    '''return render_template(
         "products.html",
         products=fetch_all("Products"),
+    )'''
+
+    response = (
+        supabase
+        .table("Products")
+        .select("id, created_at, productname, productlink")
+        .order("id")
+        .execute()
     )
+
+    products = response.data or [{
+            "id": 1,
+            "productname": "Bugspray",
+            "productlink": "https://www.amazon.com/"
+        },
+        {
+            "id": 2,
+            "productname": "diatomaceous earth",
+            "productlink": "https://www.amazon.com/"
+        }
+]
+
+    return render_template("products.html", products=products)
+
+
 
 
 @app.route("/pestcontrol")
